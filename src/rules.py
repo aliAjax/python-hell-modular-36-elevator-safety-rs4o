@@ -101,15 +101,76 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+ALARM_DONE_STATUSES = ("closed", "false_alarm")
+
+
+def _equipment_open_alarms(lookup, equipment_id):
+    return [
+        alarm
+        for alarm in _all(lookup, "alarm")
+        if alarm["data"].get("equipment_id") == equipment_id
+        and alarm["status"] not in ALARM_DONE_STATUSES
+    ]
+
+
+def _equipment_blockers(lookup, equipment_id):
+    """Reasons why an equipment cannot currently support a return-to-service permit."""
+    blockers = []
+    equipment = _find_one(lookup, "equipment", "id", equipment_id)
+    if not equipment:
+        blockers.append({"type": "equipment_missing", "reason": "设备不存在"})
+        return blockers
+    if equipment["status"] != "in_service":
+        blockers.append(
+            {"type": "equipment_status", "reason": "设备状态为%s，恢复许可需重新复核" % equipment["status"]}
+        )
+    for alarm in _equipment_open_alarms(lookup, equipment_id):
+        blockers.append(
+            {
+                "type": "open_alarm",
+                "entity_id": alarm["id"],
+                "reason": "设备存在未关闭报警（%s）" % alarm["data"].get("code", alarm["id"]),
+            }
+        )
+    for remediation in _all(lookup, "remediation"):
+        if (
+            remediation["data"].get("equipment_id") == equipment_id
+            and remediation["status"] != "closed"
+        ):
+            blockers.append(
+                {
+                    "type": "open_remediation",
+                    "entity_id": remediation["id"],
+                    "reason": "存在未关闭整改（%s）" % remediation["data"].get("issue", remediation["id"]),
+                }
+            )
+    passed = [
+        inspection
+        for inspection in _all(lookup, "inspection")
+        if inspection["data"].get("equipment_id") == equipment_id
+        and inspection["status"] == "passed"
+    ]
+    if not passed:
+        blockers.append({"type": "missing_inspection", "reason": "缺少已通过的检验"})
+    return blockers
+
+
+def _require_no_open_alarm(label):
+    """Gate for inspection/maintenance results: an unclosed alarm blocks them."""
+
+    def _check(actor, entity, data, lookup):
+        alarms = _equipment_open_alarms(lookup, entity["data"].get("equipment_id"))
+        if alarms:
+            raise ConflictError("设备存在未关闭报警，%s结果暂不生效" % label)
+        return {}
+
+    return _check
+
+
 def _grant_permit(actor, entity, data, lookup):
-    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
-    if not equipment or equipment["status"] not in ("in_service", "suspended"):
-        raise ConflictError("permit can only be granted for a serviceable equipment")
-    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
-        raise ConflictError("permit requires a passed inspection")
-    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
-        raise ConflictError("permit blocked by open remediation")
+    blockers = _equipment_blockers(lookup, entity["data"].get("equipment_id"))
+    if blockers:
+        raise ConflictError(blockers[0]["reason"])
     return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
 
 
@@ -130,13 +191,17 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "offline_records": "offline_record",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
         "permit": "blocked",
+        "offline_record": "received",
     }
+    OFFLINE_RECORD_STATUSES = (
+        "received", "applied", "stale", "held", "rejected",
+    )
     TRANSITIONS = {
         "equipment": {
             "suspend": (("in_service",), "suspended"),
@@ -174,6 +239,13 @@ class RuleEngine:
             "grant": (("pending_review",), "granted"),
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
+            "return_to_review": (("granted",), "pending_review"),
+        },
+        "offline_record": {
+            "mark_applied": (("received", "held"), "applied"),
+            "mark_stale": (("received", "held"), "stale"),
+            "mark_held": (("received",), "held"),
+            "mark_rejected": (("received", "held"), "rejected"),
         },
     }
     CREATE_REQUIRED = {
@@ -211,6 +283,8 @@ class RuleEngine:
         "fail": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
         "start": ("admin", "maintenance"),
+        ("maintenance", "complete"): ("admin", "maintenance", "inspector"),
+        ("rescue_job", "complete"): ("admin", "maintenance", "dispatcher"),
         "complete": ("admin", "maintenance", "dispatcher"),
         "dispatch": ("admin", "dispatcher"),
         "mark_false": ("admin", "dispatcher", "inspector"),
@@ -224,8 +298,10 @@ class RuleEngine:
         "request_review": ("admin", "inspector"),
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
+        ("permit", "return_to_review"): ("admin", "inspector"),
         "expire": ("admin", "inspector"),
     }
+    OFFLINE_KINDS = ("inspection", "maintenance")
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
         "inspection": lambda a, d, l: _validate_inspection(d, l),
@@ -239,6 +315,9 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("inspection", "pass"): _require_no_open_alarm("检验"),
+        ("inspection", "fail"): _require_no_open_alarm("检验"),
+        ("maintenance", "complete"): _require_no_open_alarm("维保"),
     }
 
     def normalize_kind(self, kind):
@@ -278,3 +357,57 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_offline_record(self, raw):
+        """Shape-check one offline inspection/maintenance record."""
+        if not isinstance(raw, dict):
+            raise ValidationError("each offline record must be an object")
+        kind = self.normalize_kind(str(raw.get("kind", "")))
+        if kind not in self.OFFLINE_KINDS:
+            raise ValidationError("offline record kind must be one of: %s" % ",".join(self.OFFLINE_KINDS))
+        target_id = str(raw.get("target_id", "")).strip()
+        if not target_id:
+            raise ValidationError("target_id is required")
+        action = str(raw.get("action", "")).strip()
+        if action not in self.TRANSITIONS.get(kind, {}):
+            raise ValidationError("unknown offline action %s for %s" % (action, kind))
+        base_version = raw.get("base_version")
+        if isinstance(base_version, bool) or not isinstance(base_version, int) or base_version < 1:
+            raise ValidationError("base_version must be a positive integer")
+        payload = raw.get("payload")
+        if not isinstance(payload, dict):
+            raise ValidationError("payload must be an object")
+        return kind, target_id, action, base_version, dict(payload)
+
+    def intended_next_status(self, kind, action):
+        return self.TRANSITIONS[kind][action][1]
+
+    def offline_diff(self, kind, target, action, payload):
+        """List differences between an offline record and the center's current copy."""
+        diffs = []
+        center_status = target["status"]
+        intended_status = self.intended_next_status(kind, action)
+        if center_status != intended_status:
+            diffs.append(
+                {"field": "status", "center": center_status, "offline": intended_status}
+            )
+        for key, offline_value in sorted(payload.items()):
+            if key in ("target_id", "base_version"):
+                continue
+            center_value = target["data"].get(key)
+            if center_value != offline_value:
+                diffs.append({"field": "data." + key, "center": center_value, "offline": offline_value})
+        return diffs
+
+    def apply_system_transition(self, entity, action, patch, lookup=None):
+        """Transition used by the system itself (no role gate), e.g. permit recompute."""
+        kind = self.normalize_kind(entity["kind"])
+        transition = self.TRANSITIONS.get(kind, {}).get(action)
+        if not transition:
+            raise InvalidTransition("unknown action %s for %s" % (action, kind))
+        allowed_statuses, next_status = transition
+        if entity["status"] not in allowed_statuses:
+            raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
+        merged = dict(entity["data"])
+        merged.update(patch or {})
+        return next_status, merged
