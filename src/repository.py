@@ -54,6 +54,19 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS offline_records (
+                    source_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    processed_at TEXT NOT NULL,
+                    PRIMARY KEY(source_id, record_id, version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_offline_records_lookup
+                    ON offline_records(source_id, record_id, version);
             """)
 
     @staticmethod
@@ -198,6 +211,37 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def get_offline_record(self, source_id, record_id, version):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM offline_records WHERE source_id = ? AND record_id = ? AND version = ?",
+                (source_id, record_id, int(version)),
+            ).fetchone()
+        return self._offline_from_row(row) if row else None
+
+    def save_offline_record(self, source_id, record_id, version, entity_id, kind, result, detail):
+        payload = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO offline_records"
+                "(source_id, record_id, version, entity_id, kind, result, detail, processed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (source_id, record_id, int(version), entity_id, kind, result, payload, utcnow()),
+            )
+
+    @staticmethod
+    def _offline_from_row(row):
+        return {
+            "source_id": row["source_id"],
+            "record_id": row["record_id"],
+            "version": int(row["version"]),
+            "entity_id": row["entity_id"],
+            "kind": row["kind"],
+            "result": row["result"],
+            "detail": json.loads(row["detail"]),
+            "processed_at": row["processed_at"],
+        }
 
     def ping(self):
         with self._connect() as connection:

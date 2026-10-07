@@ -172,6 +172,7 @@ class RuleEngine:
         "permit": {
             "request_review": (("blocked",), "pending_review"),
             "grant": (("pending_review",), "granted"),
+            "reconsider": (("granted", "pending_review"), "pending_review"),
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
@@ -193,11 +194,12 @@ class RuleEngine:
         ("remediation", "submit_evidence"): ("evidence",),
         ("alarm", "resolve"): ("resolution",),
         ("permit", "revoke"): ("reason",),
+        ("permit", "reconsider"): ("reason",),
     }
     CREATE_ROLES = {
         "equipment": ("admin", "inspector"),
         "inspection": ("admin", "inspector"),
-        "maintenance": ("admin", "maintenance"),
+        "maintenance": ("admin", "maintenance", "inspector"),
         "alarm": ("admin", "dispatcher", "inspector"),
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
@@ -211,7 +213,9 @@ class RuleEngine:
         "fail": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
         "start": ("admin", "maintenance"),
+        ("maintenance", "start"): ("admin", "maintenance", "inspector"),
         "complete": ("admin", "maintenance", "dispatcher"),
+        ("maintenance", "complete"): ("admin", "maintenance", "inspector"),
         "dispatch": ("admin", "dispatcher"),
         "mark_false": ("admin", "dispatcher", "inspector"),
         "resolve": ("admin", "dispatcher"),
@@ -223,6 +227,7 @@ class RuleEngine:
         "reject": ("admin", "inspector"),
         "request_review": ("admin", "inspector"),
         "grant": ("admin", "inspector"),
+        "reconsider": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
     }
